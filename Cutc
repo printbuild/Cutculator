@@ -1,0 +1,188 @@
+!pip install ezdxf
+!pip install dxfgrabber
+!pip install aiogram ezdxf
+
+
+
+
+import asyncio
+import logging
+import ezdxf
+import math
+from ezdxf.math import Vec3
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+from aiogram.filters import Command
+import os
+
+TOKEN = "7762345234:AAEXGt5um0ffbpXMcs-q40QEMXdJhGcvDos"
+
+logging.basicConfig(level=logging.INFO)
+
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+# Хранилище пользователей
+registered_users = {}
+
+# Список администраторов
+ADMIN_IDS = [610537237]  # Укажи здесь ID администраторов
+
+keyboard = ReplyKeyboardMarkup(
+    keyboard=[
+        [KeyboardButton(text="🔢 Начать расчёт")],
+        [KeyboardButton(text="📝 Оставить отзыв")]  # Кнопка для отзыва
+    ],
+    resize_keyboard=True
+)
+
+coefficients = {}
+cutting_cost = None
+
+@dp.message(Command("start"))
+async def start_command(message: types.Message):
+    user_id = message.from_user.id
+    if user_id not in registered_users:
+        registered_users[user_id] = {"registered": False}
+        await message.answer("Привет!👋 Давай сначала зарегистрируем тебя. Напиши свою почту")
+    else:
+        await message.answer("Привет!👋 Это Каткулятор 🧮 - автоматизированный расчет стоимости реза ваших изделий из фанеры, металла и других материалов.", reply_markup=keyboard)
+
+@dp.message(Command("users"))
+async def list_users(message: types.Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет прав для выполнения этой команды.")
+        return
+
+    if not registered_users:
+        await message.answer("📋 Список пользователей пуст.")
+        return
+
+    user_list = "\n".join([f"👤 ID: {user_id}, Почта: {data['mail']}"
+                            for user_id, data in registered_users.items() if data["registered"]])
+
+    await message.answer(f"📋 *Список пользователей:*\n{user_list}", parse_mode="Markdown")
+
+@dp.message(lambda message: message.from_user.id in registered_users and not registered_users[message.from_user.id]["registered"])
+async def register_user(message: types.Message):
+    user_id = message.from_user.id
+    try:
+        mail_user = int(message.text)
+        registered_users[user_id] = {"registered": True, "mail": mail_user}
+        await message.answer("✅ Регистрация завершена! Теперь ты можешь начать расчет стоимости реза.", reply_markup=keyboard)
+    except ValueError:
+        await message.answer("❌ Пожалуйста, введи число - среднее количество заказов в месяц.")
+
+@dp.message(lambda message: message.text == "🔢 Начать расчёт")
+async def input_coefficients(message: types.Message):
+    await message.answer("Введите коэффициенты для линий, полилиний, дуг, окружностей и сплайнов через пробел")
+
+@dp.message(lambda message: message.text and len(message.text.split()) == 5)
+async def set_coefficients(message: types.Message):
+    global coefficients
+    try:
+        values = list(map(float, message.text.split()))
+        coefficients = {"LINE": values[0], "POLYLINE": values[1], "ARC": values[2], "CIRCLE": values[3], "SPLINE": values[4]}
+        await message.answer("✅ Коэффициенты сохранены. Теперь введите стоимость реза (за мм).")
+    except ValueError:
+        await message.answer("❌ Ошибка! Введите 5 чисел через пробел.")
+
+@dp.message(lambda message: message.text and message.text.replace('.', '', 1).isdigit())
+async def set_cutting_cost(message: types.Message):
+    global cutting_cost
+    try:
+        cutting_cost = float(message.text)
+        await message.answer("✅ Стоимость реза сохранена. Теперь загрузите DXF-файл.")
+    except ValueError:
+        await message.answer("❌ Ошибка! Введите корректное число.")
+
+@dp.message(lambda message: message.document)
+async def process_dxf_file(message: types.Message):
+    if not coefficients:
+        await message.answer("⚠️ Сначала введите коэффициенты!")
+        return
+    if cutting_cost is None:
+        await message.answer("⚠️ Сначала введите стоимость реза!")
+        return
+
+    document = message.document
+    if not document.file_name.endswith(".dxf"):
+        await message.answer("❌ Файл должен быть в формате DXF!")
+        return
+
+    file_path = f"downloads/{document.file_name}"
+    os.makedirs("downloads", exist_ok=True)
+
+    try:
+        file_info = await bot.get_file(document.file_id)
+        await bot.download_file(file_info.file_path, file_path)
+        await message.answer("✅ Файл загружен, начинаем обработку...")
+    except Exception as e:
+        logging.error(f"Ошибка загрузки файла: {e}")
+        await message.answer("❌ Ошибка загрузки файла.")
+        return
+
+    try:
+        doc = ezdxf.readfile(file_path)
+        msp = doc.modelspace()
+        lengths = {"LINE": 0, "POLYLINE": 0, "ARC": 0, "CIRCLE": 0, "SPLINE": 0}
+
+        for entity in msp:
+            dxftype = entity.dxftype()
+            if dxftype == "LINE":
+                lengths["LINE"] += (Vec3(entity.dxf.start) - Vec3(entity.dxf.end)).magnitude
+            elif dxftype in {"LWPOLYLINE", "POLYLINE"}:
+                points = [Vec3(p[0], p[1]) for p in entity.get_points()]
+                lengths["POLYLINE"] += sum((p1 - p2).magnitude for p1, p2 in zip(points, points[1:]))
+            elif dxftype == "ARC":
+                radius = entity.dxf.radius
+                angle_diff = math.radians((entity.dxf.end_angle - entity.dxf.start_angle) % 360)
+                lengths["ARC"] += angle_diff * radius
+            elif dxftype == "CIRCLE":
+                lengths["CIRCLE"] += 2 * math.pi * entity.dxf.radius
+            elif dxftype == "SPLINE":
+                spline_points = list(entity.flattening(distance=0.1))
+                lengths["SPLINE"] += sum((Vec3(p1) - Vec3(p2)).magnitude for p1, p2 in zip(spline_points, spline_points[1:]))
+
+        total_length = sum(lengths.values())
+        total_adjusted = sum(lengths[key] * coefficients[key] for key in lengths)
+        total_cutting_cost = total_adjusted * cutting_cost
+
+        result_text = (
+            f"📊 *Результаты расчёта:*\n"
+            f"🔹 Длина линий: {lengths['LINE']:.2f} мм\n"
+            f"🔹 Длина полилиний: {lengths['POLYLINE']:.2f} мм\n"
+            f"🔹 Длина дуг: {lengths['ARC']:.2f} мм\n"
+            f"🔹 Длина окружностей: {lengths['CIRCLE']:.2f} мм\n"
+            f"🔹 Длина сплайнов: {lengths['SPLINE']:.2f} мм\n"
+            f"📌 *Общая длина: {total_length:.2f} мм*\n\n"
+            f"💰 *Стоимость реза: {total_cutting_cost:.2f}*"
+        )
+
+        await message.answer(result_text, parse_mode="Markdown")
+    except Exception as e:
+        logging.error(f"Ошибка обработки DXF: {e}")
+        await message.answer("❌ Ошибка обработки файла.")
+
+# Обработка отзыва
+@dp.message(lambda message: message.text == "📝 Оставить отзыв")
+async def ask_for_feedback(message: types.Message):
+    await message.answer("💬 Напишите ваш отзыв. Мы будем рады услышать ваше мнение!")
+
+@dp.message(lambda message: message.from_user.id in registered_users and message.text and message.text != "📝 Оставить отзыв")
+async def handle_feedback(message: types.Message):
+    feedback = message.text
+    user_id = message.from_user.id
+    user = registered_users.get(user_id)
+
+    # Отправляем отзыв администратору
+    for admin_id in ADMIN_IDS:
+        await bot.send_message(admin_id, f"📝 Новый отзыв от пользователя {user_id}:\n{feedback}")
+
+    await message.answer("Спасибо за ваш отзыв! Он был отправлен администраторам.")
+
+async def main():
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.create_task(main())
